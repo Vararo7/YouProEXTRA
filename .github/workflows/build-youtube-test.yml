@@ -1,4 +1,4 @@
-name: Build YouTubePlus (YTLite) IPA
+name: Build YouTube Plus (Testing - No Playback Fix)
 on:
   workflow_dispatch:
     inputs:
