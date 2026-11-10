@@ -140,10 +140,9 @@ jobs:
             exit 1
           fi
           
-      - name: Apply Experimental Quality Patch
+      - name: Verify Original Quality Array Instruction
         run: |
-          python3 scripts/patch_youtube_quality_keys.py youtube.ipa youtube-patched.ipa
-          mv youtube-patched.ipa youtube.ipa
+          python3 QualityProbe/verify_unpatched_ipa.py youtube.ipa
 
       - name: Get YouTube Version
         run: |
