@@ -1,0 +1,8 @@
+Package: com.vararo7.yt-quality-probe
+Name: YT Quality Probe
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Temporary diagnostics for the YouTube 21.44.4 quality-key crash
+Maintainer: Research build
+Author: Research build
+Section: Tweaks
