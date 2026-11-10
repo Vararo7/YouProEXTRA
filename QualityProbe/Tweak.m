@@ -8,7 +8,8 @@
 #import <string.h>
 
 /*
- * Targeted diagnostic for UNPATCHED YouTube 21.44.4.
+ * Targeted call-site diagnostic for UNPATCHED YouTube 21.44.4.
+ * v0.4 checks that the getter-hook invocations originate at the crash site.
  * Captures the original two array elements at the precise failing call.
  * Returns an empty array ONLY when that exact call contains a nil object.
  * No video, URL, profile, or object string values are intentionally logged.
@@ -32,6 +33,12 @@ static volatile uint64_t g_wifiCalls = 0;
 static volatile uint64_t g_mobileCalls = 0;
 static volatile uint64_t g_wifiNilCalls = 0;
 static volatile uint64_t g_mobileNilCalls = 0;
+static volatile uint64_t g_siteProviderCalls = 0;
+static volatile uint64_t g_siteWifiCalls = 0;
+static volatile uint64_t g_siteMobileCalls = 0;
+static volatile uint64_t g_siteProviderNil = 0;
+static volatile uint64_t g_siteWifiNil = 0;
+static volatile uint64_t g_siteMobileNil = 0;
 static BOOL g_arrayHookInstalled = NO;
 static BOOL g_alertScheduled = NO;
 static BOOL g_alertShown = NO;
@@ -116,9 +123,10 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.3 | YouTube 21.44.4 UNPATCHED original array\n"
+            @"YT QUALITY PROBE 0.4 | YouTube 21.44.4 UNPATCHED original array\n"
              @"No runtime URL/profile/content or object string values captured\n"
              @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
+             @"ORIGINAL CALLSITE MATCHES: keysProvider=%llu (nil=%llu) wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n"
              @"EXACT CALLS: total=%llu count2=%llu nil0=%llu nil1=%llu emptyFallback=%llu normalPass=%llu unexpectedCount=%llu\n\n"
              @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
@@ -126,6 +134,9 @@ static NSString *ProbeAllEvents(void) {
             (unsigned long long)g_providerCalls,
             (unsigned long long)g_wifiCalls, (unsigned long long)g_wifiNilCalls,
             (unsigned long long)g_mobileCalls, (unsigned long long)g_mobileNilCalls,
+            (unsigned long long)g_siteProviderCalls, (unsigned long long)g_siteProviderNil,
+            (unsigned long long)g_siteWifiCalls, (unsigned long long)g_siteWifiNil,
+            (unsigned long long)g_siteMobileCalls, (unsigned long long)g_siteMobileNil,
             g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
             g_arrayObserved ? @"yes" : @"no",
             (unsigned long long)g_targetCalls,
@@ -180,6 +191,13 @@ static IMP ProbeFindOriginal(id receiver, SEL selector) {
 }
 
 static id ProbeGetter(id receiver, SEL selector) {
+    // objc_msgSend normally tail-calls its IMP: LR points into the original
+    // YouTube callsite. If another tweak calls an IMP directly, LR differs.
+    // This records the caller before our probe performs any Objective-C calls.
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    uintptr_t imageBase = 0x100000000ULL + (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    uintptr_t callerOffset = caller >= imageBase && caller < imageBase + 0x0b7b0000ULL
+        ? caller - imageBase : 0;
     IMP imp = ProbeFindOriginal(receiver, selector);
     if (!imp) {
         NSLog(@"[YTQualityProbe] ERROR: missing original for %@ on %@",
@@ -201,16 +219,38 @@ static id ProbeGetter(id receiver, SEL selector) {
         callNumber = __sync_add_and_fetch(&g_mobileCalls, 1);
         if (!result) __sync_add_and_fetch(&g_mobileNilCalls, 1);
     }
+    BOOL exactProvider = isProvider && callerOffset == 0x491974ULL;
+    BOOL exactWifi = isWifi && callerOffset == 0x491980ULL;
+    BOOL exactMobile = isMobile && callerOffset == 0x491994ULL;
+    BOOL fromCrashPath = exactProvider || exactWifi || exactMobile;
+    if (exactProvider) {
+        __sync_add_and_fetch(&g_siteProviderCalls, 1);
+        if (!result) __sync_add_and_fetch(&g_siteProviderNil, 1);
+    }
+    if (exactWifi) {
+        __sync_add_and_fetch(&g_siteWifiCalls, 1);
+        if (!result) __sync_add_and_fetch(&g_siteWifiNil, 1);
+    }
+    if (exactMobile) {
+        __sync_add_and_fetch(&g_siteMobileCalls, 1);
+        if (!result) __sync_add_and_fetch(&g_siteMobileNil, 1);
+    }
     if (!g_inHook) {
         g_inHook = YES;
-        BOOL important = (!result && (isProvider || isWifi || isMobile));
-        // Don't let frequent keysProvider calls drown out the useful results.
+        BOOL important = fromCrashPath || (!result && (isProvider || isWifi || isMobile));
+        // Preserve the actual crash-path events and show the return addresses
+        // of every observed quality getter, not only their aggregate counts.
         BOOL shouldLog = important || callNumber <= (isProvider ? 3 : 12);
         if (shouldLog) {
-            ProbeRecord([NSString stringWithFormat:@"%@ call=%llu receiver=%@ return=%@ pointer=%p",
-                         NSStringFromSelector(selector), (unsigned long long)callNumber,
-                         ProbeObjectClass(receiver), ProbeObjectClass(result),
-                         (__bridge void *)result], important);
+            NSString *site = callerOffset
+                ? [NSString stringWithFormat:@"YouTube+0x%llx", (unsigned long long)callerOffset]
+                : @"outside-YouTube";
+            ProbeRecord([NSString stringWithFormat:
+                @"%@ call=%llu source=%@%@ receiver=%@ return=%@ pointer=%p",
+                NSStringFromSelector(selector), (unsigned long long)callNumber,
+                site, fromCrashPath ? @" [EXACT_CRASH_PATH]" : @"",
+                ProbeObjectClass(receiver), ProbeObjectClass(result),
+                (__bridge void *)result], important);
         }
         g_inHook = NO;
     }
