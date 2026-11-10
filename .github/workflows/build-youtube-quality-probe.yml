@@ -1,4 +1,4 @@
-name: Build YouTube Plus (Quality Patch Test)
+name: Build YouTube Plus (Quality Probe)
 on:
   workflow_dispatch:
     inputs:
