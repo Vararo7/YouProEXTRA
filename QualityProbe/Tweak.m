@@ -8,10 +8,10 @@
 #import <string.h>
 
 /*
- * Passive diagnostic for YouTube 21.44.4, used WITH the working
- * one-instruction quality-key patch. No server traffic or content is logged.
- * It records selector results, and the two stack values at the precise
- * +[NSArray arrayWithObjects:count:] call. Remove this tweak after testing.
+ * Targeted diagnostic for UNPATCHED YouTube 21.44.4.
+ * Captures the original two array elements at the precise failing call.
+ * Returns an empty array ONLY when that exact call contains a nil object.
+ * No video, URL, profile, or object string values are intentionally logged.
  */
 #define MAX_HOOKS 512
 #define MAX_EVENTS 100
@@ -36,6 +36,13 @@ static BOOL g_arrayHookInstalled = NO;
 static BOOL g_alertScheduled = NO;
 static BOOL g_alertShown = NO;
 static BOOL g_arrayObserved = NO;
+static volatile uint64_t g_targetCalls = 0;
+static volatile uint64_t g_targetCount2 = 0;
+static volatile uint64_t g_targetNil0 = 0;
+static volatile uint64_t g_targetNil1 = 0;
+static volatile uint64_t g_targetFallbacks = 0;
+static volatile uint64_t g_targetPassThrough = 0;
+static volatile uint64_t g_targetUnexpectedCount = 0;
 static id (*g_origArray)(id, SEL, const id *, NSUInteger);
 static __thread BOOL g_inHook = NO;
 
@@ -109,17 +116,26 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.2 | YouTube 21.44.4 + patched quality array\n"
-             @"Runtime URL/profile/content NOT captured\n"
-             @"COUNTS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
-             @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n\n"
+            @"YT QUALITY PROBE 0.3 | YouTube 21.44.4 UNPATCHED original array\n"
+             @"No runtime URL/profile/content or object string values captured\n"
+             @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
+             @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n"
+             @"EXACT CALLS: total=%llu count2=%llu nil0=%llu nil1=%llu emptyFallback=%llu normalPass=%llu unexpectedCount=%llu\n\n"
              @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
              @"RECENT EVENTS:\n%@",
             (unsigned long long)g_providerCalls,
             (unsigned long long)g_wifiCalls, (unsigned long long)g_wifiNilCalls,
             (unsigned long long)g_mobileCalls, (unsigned long long)g_mobileNilCalls,
             g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
-            g_arrayObserved ? @"yes" : @"no", important, events];
+            g_arrayObserved ? @"yes" : @"no",
+            (unsigned long long)g_targetCalls,
+            (unsigned long long)g_targetCount2,
+            (unsigned long long)g_targetNil0,
+            (unsigned long long)g_targetNil1,
+            (unsigned long long)g_targetFallbacks,
+            (unsigned long long)g_targetPassThrough,
+            (unsigned long long)g_targetUnexpectedCount,
+            important, events];
     }
 }
 
@@ -223,21 +239,51 @@ static void ProbeHookMethodList(Class owner) {
     if (methods) free(methods);
 }
 
-/* Called specifically when our patched YouTube calls NSArray at +0x4919b0.
- * Both pointers are already on YouTube's stack, even when the patched count=0.
- * We log addresses only; we do NOT attempt to dereference the values. */
+/* At this BL call in the original 21.44.4, return PC is 0x1004919b4.
+ * It passes a stack array of two objects (at SP+0x18) with count=2.
+ * Every other NSArray construction is passed through unchanged.
+ */
 static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger count) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
     uintptr_t expected = (uintptr_t)(0x1004919B4ULL + _dyld_get_image_vmaddr_slide(0));
-    if (ret == expected && !g_arrayObserved) {
-        g_arrayObserved = YES;
-        // Reading the two stack slots under ARC without illegal pointer casts.
-        id __unsafe_unretained wifi = objects ? objects[0] : nil;
-        id __unsafe_unretained mobile = objects ? objects[1] : nil;
-        ProbeRecord([NSString stringWithFormat:
-                     @"EXACT YouTube +0x4919b0 array call: count=%lu, wifi[0]=%p, mobile[1]=%p",
-                     (unsigned long)count, (__bridge void *)wifi, (__bridge void *)mobile], YES);
+    if (ret != expected) return g_origArray(receiver, selector, objects, count);
+
+    g_arrayObserved = YES;
+    uint64_t callNumber = __sync_add_and_fetch(&g_targetCalls, 1);
+    if (count != 2) {
+        __sync_add_and_fetch(&g_targetUnexpectedCount, 1);
+        if (callNumber <= 5) {
+            ProbeRecord([NSString stringWithFormat:
+                @"EXACT CALL #%llu UNEXPECTED count=%lu (wanted original 2); no fallback",
+                (unsigned long long)callNumber, (unsigned long)count], YES);
+        }
+        return g_origArray(receiver, selector, objects, count);
     }
+    __sync_add_and_fetch(&g_targetCount2, 1);
+
+    // The pointer access below is ARC-compatible (compiled in probe v0.2).
+    id __unsafe_unretained first = objects ? objects[0] : nil;
+    id __unsafe_unretained second = objects ? objects[1] : nil;
+    BOOL firstNil = (first == nil);
+    BOOL secondNil = (second == nil);
+    if (firstNil) __sync_add_and_fetch(&g_targetNil0, 1);
+    if (secondNil) __sync_add_and_fetch(&g_targetNil1, 1);
+    BOOL needsFallback = firstNil || secondNil;
+    if (needsFallback) __sync_add_and_fetch(&g_targetFallbacks, 1);
+    else __sync_add_and_fetch(&g_targetPassThrough, 1);
+
+    if (callNumber <= 8 || needsFallback) {
+        ProbeRecord([NSString stringWithFormat:
+            @"EXACT CALL #%llu count=2 first[0]=%p (%@) second[1]=%p (%@) action=%@",
+            (unsigned long long)callNumber,
+            (__bridge void *)first, ProbeObjectClass(first),
+            (__bridge void *)second, ProbeObjectClass(second),
+            needsFallback ? @"EMPTY_ARRAY_FALLBACK" : @"ORIGINAL_ARRAY"], YES);
+    }
+
+    // Avoid the exception only for this call with missing entries. If both
+    // entries are valid, preserve YouTube's original array behavior.
+    if (needsFallback) return g_origArray(receiver, selector, NULL, 0);
     return g_origArray(receiver, selector, objects, count);
 }
 
