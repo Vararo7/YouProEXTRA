@@ -385,6 +385,12 @@ jobs:
           cd PleaseDontStopTheMusic
           make -C rootless clean package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS=arm64
           mv rootless/packages/*.deb ${{ github.workspace }}/pleasedontstopthemusic.deb
+
+      - name: Build Temporary Quality Diagnostic
+        run: |
+          cd QualityProbe
+          make clean package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS=arm64
+          mv packages/*.deb "${{ github.workspace }}/qualityprobe.deb"
           
       - name: Inject Tweaks Into IPA
         run: |
