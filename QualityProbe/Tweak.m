@@ -70,7 +70,19 @@ static UIViewController *ProbeTopController(void) {
         }
         if (window) break;
     }
-    if (!window) window = app.keyWindow;
+    // Fallback for inactive/transitional scenes (without deprecated keyWindow).
+    if (!window) {
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+                if (candidate.isKeyWindow || candidate.rootViewController) {
+                    window = candidate;
+                    break;
+                }
+            }
+            if (window) break;
+        }
+    }
     UIViewController *controller = window.rootViewController;
     while (controller.presentedViewController) {
         controller = controller.presentedViewController;
@@ -178,11 +190,12 @@ static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger co
     uintptr_t expected = (uintptr_t)(0x1004919B4ULL + _dyld_get_image_vmaddr_slide(0));
     if (ret == expected && !g_arrayObserved) {
         g_arrayObserved = YES;
-        const void *wifi = objects ? ((const void * const *)objects)[0] : NULL;
-        const void *mobile = objects ? ((const void * const *)objects)[1] : NULL;
+        // Reading the two stack slots under ARC without illegal pointer casts.
+        id __unsafe_unretained wifi = objects ? objects[0] : nil;
+        id __unsafe_unretained mobile = objects ? objects[1] : nil;
         ProbeRecord([NSString stringWithFormat:
                      @"EXACT YouTube +0x4919b0 array call: count=%lu, wifi[0]=%p, mobile[1]=%p",
-                     (unsigned long)count, wifi, mobile], YES);
+                     (unsigned long)count, (__bridge void *)wifi, (__bridge void *)mobile], YES);
     }
     return g_origArray(receiver, selector, objects, count);
 }
@@ -197,7 +210,6 @@ static void ProbeInstall(void) {
     }
     if (classes) free(classes);
 
-    Class arrayMeta = object_getClass([NSArray class]);
     Method arrayMethod = class_getClassMethod([NSArray class], @selector(arrayWithObjects:count:));
     if (arrayMethod) {
         g_origArray = (id (*)(id, SEL, const id *, NSUInteger))method_getImplementation(arrayMethod);
