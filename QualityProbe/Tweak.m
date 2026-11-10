@@ -14,7 +14,8 @@
  * +[NSArray arrayWithObjects:count:] call. Remove this tweak after testing.
  */
 #define MAX_HOOKS 512
-#define MAX_EVENTS 60
+#define MAX_EVENTS 100
+#define MAX_IMPORTANT 30
 
 typedef struct {
     __unsafe_unretained Class owner; /* class or metaclass that directly implements selector */
@@ -25,6 +26,13 @@ typedef struct {
 static ProbeHook g_hooks[MAX_HOOKS];
 static unsigned g_hookCount = 0;
 static NSMutableArray<NSString *> *g_events;
+static NSMutableArray<NSString *> *g_importantEvents;
+static volatile uint64_t g_providerCalls = 0;
+static volatile uint64_t g_wifiCalls = 0;
+static volatile uint64_t g_mobileCalls = 0;
+static volatile uint64_t g_wifiNilCalls = 0;
+static volatile uint64_t g_mobileNilCalls = 0;
+static BOOL g_arrayHookInstalled = NO;
 static BOOL g_alertScheduled = NO;
 static BOOL g_alertShown = NO;
 static BOOL g_arrayObserved = NO;
@@ -55,6 +63,10 @@ static void ProbeRecord(NSString *event, BOOL important) {
     @synchronized (g_events) {
         if (g_events.count >= MAX_EVENTS) [g_events removeObjectAtIndex:0];
         [g_events addObject:event];
+        // Preserve the FIRST important results; routine calls cannot push them out.
+        if (important && g_importantEvents.count < MAX_IMPORTANT) {
+            [g_importantEvents addObject:event];
+        }
     }
     if (important) ProbeScheduleAlert();
 }
@@ -92,10 +104,22 @@ static UIViewController *ProbeTopController(void) {
 
 static NSString *ProbeAllEvents(void) {
     @synchronized (g_events) {
+        NSString *important = g_importantEvents.count > 0
+            ? [g_importantEvents componentsJoinedByString:@"\n"]
+            : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.1 | YouTube 21.44.4 + patched quality array\n"
-             @"Runtime URL/profile/content NOT captured\n\n%@", events];
+            @"YT QUALITY PROBE 0.2 | YouTube 21.44.4 + patched quality array\n"
+             @"Runtime URL/profile/content NOT captured\n"
+             @"COUNTS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
+             @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n\n"
+             @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
+             @"RECENT EVENTS:\n%@",
+            (unsigned long long)g_providerCalls,
+            (unsigned long long)g_wifiCalls, (unsigned long long)g_wifiNilCalls,
+            (unsigned long long)g_mobileCalls, (unsigned long long)g_mobileNilCalls,
+            g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
+            g_arrayObserved ? @"yes" : @"no", important, events];
     }
 }
 
@@ -117,7 +141,7 @@ static void ProbeShowAlertAttempts(int retries) {
                          componentsJoinedByString:@"\n"];
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"YouTube quality diagnostic"
-        message:[NSString stringWithFormat:@"Captured the quality-key failure path. Copy the full report, then paste it into ChatGPT.\n\n%@", summary]
+        message:[NSString stringWithFormat:@"Quality diagnostic: copy the full report and paste it into ChatGPT.\n\n%@", summary]
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Copy full report"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
@@ -147,14 +171,31 @@ static id ProbeGetter(id receiver, SEL selector) {
         return nil;
     }
     id result = ((id (*)(id, SEL))imp)(receiver, selector);
+    const char *sel = sel_getName(selector);
+    BOOL isProvider = strcmp(sel, "keysProvider") == 0;
+    BOOL isWifi = strcmp(sel, "persistentVideoQualityWifiKey") == 0;
+    BOOL isMobile = strcmp(sel, "persistentVideoQualityMobileKey") == 0;
+    uint64_t callNumber = 0;
+    if (isProvider) callNumber = __sync_add_and_fetch(&g_providerCalls, 1);
+    if (isWifi) {
+        callNumber = __sync_add_and_fetch(&g_wifiCalls, 1);
+        if (!result) __sync_add_and_fetch(&g_wifiNilCalls, 1);
+    }
+    if (isMobile) {
+        callNumber = __sync_add_and_fetch(&g_mobileCalls, 1);
+        if (!result) __sync_add_and_fetch(&g_mobileNilCalls, 1);
+    }
     if (!g_inHook) {
         g_inHook = YES;
-        const char *sel = sel_getName(selector);
-        BOOL important = (!result && (strcmp(sel, "keysProvider") == 0 ||
-                                           strcmp(sel, "persistentVideoQualityWifiKey") == 0));
-        ProbeRecord([NSString stringWithFormat:@"%@ receiver=%@ return=%@ pointer=%p",
-                     NSStringFromSelector(selector), ProbeObjectClass(receiver),
-                     ProbeObjectClass(result), (__bridge void *)result], important);
+        BOOL important = (!result && (isProvider || isWifi || isMobile));
+        // Don't let frequent keysProvider calls drown out the useful results.
+        BOOL shouldLog = important || callNumber <= (isProvider ? 3 : 12);
+        if (shouldLog) {
+            ProbeRecord([NSString stringWithFormat:@"%@ call=%llu receiver=%@ return=%@ pointer=%p",
+                         NSStringFromSelector(selector), (unsigned long long)callNumber,
+                         ProbeObjectClass(receiver), ProbeObjectClass(result),
+                         (__bridge void *)result], important);
+        }
         g_inHook = NO;
     }
     return result;
@@ -202,6 +243,7 @@ static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger co
 
 static void ProbeInstall(void) {
     g_events = [[NSMutableArray alloc] init];
+    g_importantEvents = [[NSMutableArray alloc] init];
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     for (unsigned int i = 0; i < classCount; ++i) {
@@ -211,6 +253,7 @@ static void ProbeInstall(void) {
     if (classes) free(classes);
 
     Method arrayMethod = class_getClassMethod([NSArray class], @selector(arrayWithObjects:count:));
+    g_arrayHookInstalled = arrayMethod != NULL;
     if (arrayMethod) {
         g_origArray = (id (*)(id, SEL, const id *, NSUInteger))method_getImplementation(arrayMethod);
         method_setImplementation(arrayMethod, (IMP)ProbeArray);
