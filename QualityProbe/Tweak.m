@@ -9,7 +9,7 @@
 
 /*
  * Targeted call-site diagnostic for UNPATCHED YouTube 21.44.4.
- * v0.6 snapshots caller-preserved ARM64 registers at the verified array call.
+ * v0.7 snapshots the upstream helper input (x19) at the verified array call.
  * No runtime executable-page hooking or modification.
  * Captures the original two array elements at the precise failing call.
  * Returns an empty array ONLY when that exact call contains a nil object.
@@ -53,6 +53,7 @@ static volatile uint64_t g_targetPassThrough = 0;
 static volatile uint64_t g_targetUnexpectedCount = 0;
 static volatile uint64_t g_snapshotCalls = 0;
 static volatile uint64_t g_nilStoredReceiver = 0;
+static volatile uint64_t g_nilHelperInput = 0;
 static volatile uint64_t g_nilProviderRegister = 0;
 static volatile uint64_t g_snapshotMismatches = 0;
 static id (*g_origArray)(id, SEL, const id *, NSUInteger);
@@ -128,12 +129,12 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.6 | YouTube 21.44.4 UNPATCHED original array\n"
+            @"YT QUALITY PROBE 0.7 | YouTube 21.44.4 UNPATCHED original array\n"
              @"No runtime URL/profile/content or object string values captured\n"
              @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"ORIGINAL CALLSITE MATCHES: keysProvider=%llu (nil=%llu) wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n"
-             @"REGISTER SNAPSHOT: calls=%llu storedReceiverNil=%llu providerRegisterNil=%llu keyRegisterMismatch=%llu\n"
+             @"REGISTER SNAPSHOT: calls=%llu helperInputNil=%llu storedReceiverNil=%llu providerRegisterNil=%llu mobileRegMismatch=%llu\n"
              @"EXACT CALLS: total=%llu count2=%llu nil0=%llu nil1=%llu emptyFallback=%llu normalPass=%llu unexpectedCount=%llu\n\n"
              @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
              @"RECENT EVENTS:\n%@",
@@ -146,6 +147,7 @@ static NSString *ProbeAllEvents(void) {
             g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
             g_arrayObserved ? @"yes" : @"no",
             (unsigned long long)g_snapshotCalls,
+            (unsigned long long)g_nilHelperInput,
             (unsigned long long)g_nilStoredReceiver,
             (unsigned long long)g_nilProviderRegister,
             (unsigned long long)g_snapshotMismatches,
@@ -294,11 +296,12 @@ static void ProbeHookMethodList(Class owner) {
  * Objective-C method replacement that worked in probe 0.4. It does not alter
  * YouTube's executable memory (unlike the failed native hook in v0.5).
  *
- * ARM64: at the exact YouTube+0x4919b0 call, x20 = owning internal object;
- * x22 = keysProvider result; x23 = mobile key result;
- * x24 = Wi-Fi key result. These are callee-saved registers, so the Objective-C
- * dispatch machinery must preserve them. We copy them into the unused
- * argument registers x4..x7, then tail-branch to our normal Objective-C IMP.
+ * ARM64: at the exact YouTube+0x4919b0 call, x19 = object originally
+ * passed to the helper (+0xE3AB8); x20 = owning internal object;
+ * x22 = keysProvider result; x23 = mobile key result. All are callee-saved
+ * and survive the intervening Objective-C calls. We copy them into free
+ * argument registers x4..x7, then tail-branch to our Objective-C IMP.
+ * The Wi-Fi key remains captured directly from original objects[0].
  * The original lr/sp/ABI are unchanged. On other callsites we pass through.
  *
  * This is still device-untested, version-specific instrumentation.
@@ -306,7 +309,7 @@ static void ProbeHookMethodList(Class owner) {
 extern id ProbeArrayEntry(id receiver, SEL selector, const id *objects, NSUInteger count);
 id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInteger count,
                            uintptr_t ownerX20, uintptr_t providerX22,
-                           uintptr_t mobileX23, uintptr_t wifiX24)
+                           uintptr_t mobileX23, uintptr_t helperInputX19)
     __attribute__((used, noinline));
 
 __asm__(
@@ -317,14 +320,14 @@ __asm__(
     "mov x4, x20\n"
     "mov x5, x22\n"
     "mov x6, x23\n"
-    "mov x7, x24\n"
+    "mov x7, x19\n"
     "b _ProbeArrayWithRegisters\n"
 );
 
 /* Return address from the original BL at YouTube+0x4919b0 is +0x4919b4. */
 id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInteger count,
                            uintptr_t ownerX20, uintptr_t providerX22,
-                           uintptr_t mobileX23, uintptr_t wifiX24) {
+                           uintptr_t mobileX23, uintptr_t helperInputX19) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
     uintptr_t expected = (uintptr_t)(0x1004919B4ULL + _dyld_get_image_vmaddr_slide(0));
     if (ret != expected) return g_origArray(receiver, selector, objects, count);
@@ -362,19 +365,21 @@ id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInte
     if (!ownerNull) {
         memcpy(&storedReceiver, (const void *)(ownerX20 + 0x18), sizeof(storedReceiver));
     }
+    if (helperInputX19 == 0) __sync_add_and_fetch(&g_nilHelperInput, 1);
     if (storedReceiver == 0) __sync_add_and_fetch(&g_nilStoredReceiver, 1);
     if (providerX22 == 0) __sync_add_and_fetch(&g_nilProviderRegister, 1);
-    BOOL regsMatchArray = (wifiX24 == firstPtr && mobileX23 == secondPtr);
-    if (!regsMatchArray) __sync_add_and_fetch(&g_snapshotMismatches, 1);
+    BOOL mobileRegMatch = (mobileX23 == secondPtr);
+    if (!mobileRegMatch) __sync_add_and_fetch(&g_snapshotMismatches, 1);
 
     if (callNumber <= 8 || needsFallback) {
         ProbeRecord([NSString stringWithFormat:
-            @"EXACT CALL #%llu count=2 owner[x20]=%p storedReceiver[x20+0x18]=%p provider[x22]=%p wifi[x24]=%p mobile[x23]=%p array[0]=%p array[1]=%p regMatches=%@ action=%@",
+            @"EXACT CALL #%llu count=2 helperInput[x19]=%p helperInputClass=%@ owner[x20]=%p ownerClass=%@ storedReceiver[x20+0x18]=%p provider[x22]=%p mobile[x23]=%p array[0]=%p array[1]=%p mobileRegMatch=%@ action=%@",
             (unsigned long long)callNumber,
-            (void *)ownerX20, (void *)storedReceiver, (void *)providerX22,
-            (void *)wifiX24, (void *)mobileX23,
+            (void *)helperInputX19, ProbeObjectClass((__bridge id)(void *)helperInputX19),
+            (void *)ownerX20, ProbeObjectClass((__bridge id)(void *)ownerX20),
+            (void *)storedReceiver, (void *)providerX22, (void *)mobileX23,
             (void *)firstPtr, (void *)secondPtr,
-            regsMatchArray ? @"yes" : @"no",
+            mobileRegMatch ? @"yes" : @"no",
             needsFallback ? @"EMPTY_ARRAY_FALLBACK" : @"ORIGINAL_ARRAY"], YES);
     }
 
