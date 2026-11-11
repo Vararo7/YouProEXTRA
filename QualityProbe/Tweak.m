@@ -6,12 +6,11 @@
 #import <stdint.h>
 #import <stdlib.h>
 #import <string.h>
-#import <dlfcn.h>
 
 /*
  * Targeted call-site diagnostic for UNPATCHED YouTube 21.44.4.
- * v0.5 checks the helper that populates the receiver at [x20+0x18].
- * v0.4 caller-address verification is retained.
+ * v0.6 snapshots caller-preserved ARM64 registers at the verified array call.
+ * No runtime executable-page hooking or modification.
  * Captures the original two array elements at the precise failing call.
  * Returns an empty array ONLY when that exact call contains a nil object.
  * No video, URL, profile, or object string values are intentionally logged.
@@ -42,11 +41,6 @@ static volatile uint64_t g_siteProviderNil = 0;
 static volatile uint64_t g_siteWifiNil = 0;
 static volatile uint64_t g_siteMobileNil = 0;
 static BOOL g_arrayHookInstalled = NO;
-static BOOL g_helperHookInstalled = NO;
-static volatile uint64_t g_helperAtSiteCalls = 0;
-static volatile uint64_t g_helperNilInput = 0;
-static volatile uint64_t g_helperNilResult = 0;
-static void *(*g_origQualityReceiverHelper)(void *);
 static BOOL g_alertScheduled = NO;
 static BOOL g_alertShown = NO;
 static BOOL g_arrayObserved = NO;
@@ -57,6 +51,10 @@ static volatile uint64_t g_targetNil1 = 0;
 static volatile uint64_t g_targetFallbacks = 0;
 static volatile uint64_t g_targetPassThrough = 0;
 static volatile uint64_t g_targetUnexpectedCount = 0;
+static volatile uint64_t g_snapshotCalls = 0;
+static volatile uint64_t g_nilStoredReceiver = 0;
+static volatile uint64_t g_nilProviderRegister = 0;
+static volatile uint64_t g_snapshotMismatches = 0;
 static id (*g_origArray)(id, SEL, const id *, NSUInteger);
 static __thread BOOL g_inHook = NO;
 
@@ -130,12 +128,12 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.5 | YouTube 21.44.4 UNPATCHED original array\n"
+            @"YT QUALITY PROBE 0.6 | YouTube 21.44.4 UNPATCHED original array\n"
              @"No runtime URL/profile/content or object string values captured\n"
              @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"ORIGINAL CALLSITE MATCHES: keysProvider=%llu (nil=%llu) wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
-             @"RECEIVER HELPER: installed=%@ siteCalls=%llu nilInput=%llu nilResult=%llu\n"
              @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n"
+             @"REGISTER SNAPSHOT: calls=%llu storedReceiverNil=%llu providerRegisterNil=%llu keyRegisterMismatch=%llu\n"
              @"EXACT CALLS: total=%llu count2=%llu nil0=%llu nil1=%llu emptyFallback=%llu normalPass=%llu unexpectedCount=%llu\n\n"
              @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
              @"RECENT EVENTS:\n%@",
@@ -145,12 +143,12 @@ static NSString *ProbeAllEvents(void) {
             (unsigned long long)g_siteProviderCalls, (unsigned long long)g_siteProviderNil,
             (unsigned long long)g_siteWifiCalls, (unsigned long long)g_siteWifiNil,
             (unsigned long long)g_siteMobileCalls, (unsigned long long)g_siteMobileNil,
-            g_helperHookInstalled ? @"yes" : @"no",
-            (unsigned long long)g_helperAtSiteCalls,
-            (unsigned long long)g_helperNilInput,
-            (unsigned long long)g_helperNilResult,
             g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
             g_arrayObserved ? @"yes" : @"no",
+            (unsigned long long)g_snapshotCalls,
+            (unsigned long long)g_nilStoredReceiver,
+            (unsigned long long)g_nilProviderRegister,
+            (unsigned long long)g_snapshotMismatches,
             (unsigned long long)g_targetCalls,
             (unsigned long long)g_targetCount2,
             (unsigned long long)g_targetNil0,
@@ -291,11 +289,42 @@ static void ProbeHookMethodList(Class owner) {
     if (methods) free(methods);
 }
 
-/* At this BL call in the original 21.44.4, return PC is 0x1004919b4.
- * It passes a stack array of two objects (at SP+0x18) with count=2.
- * Every other NSArray construction is passed through unchanged.
+/*
+ * ProbeArrayEntry is a tiny ABI-preserving shim installed through the SAME
+ * Objective-C method replacement that worked in probe 0.4. It does not alter
+ * YouTube's executable memory (unlike the failed native hook in v0.5).
+ *
+ * ARM64: at the exact YouTube+0x4919b0 call, x20 = owning internal object;
+ * x22 = keysProvider result; x23 = mobile key result;
+ * x24 = Wi-Fi key result. These are callee-saved registers, so the Objective-C
+ * dispatch machinery must preserve them. We copy them into the unused
+ * argument registers x4..x7, then tail-branch to our normal Objective-C IMP.
+ * The original lr/sp/ABI are unchanged. On other callsites we pass through.
+ *
+ * This is still device-untested, version-specific instrumentation.
  */
-static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger count) {
+extern id ProbeArrayEntry(id receiver, SEL selector, const id *objects, NSUInteger count);
+id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInteger count,
+                           uintptr_t ownerX20, uintptr_t providerX22,
+                           uintptr_t mobileX23, uintptr_t wifiX24)
+    __attribute__((used, noinline));
+
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl _ProbeArrayEntry\n"
+    "_ProbeArrayEntry:\n"
+    "mov x4, x20\n"
+    "mov x5, x22\n"
+    "mov x6, x23\n"
+    "mov x7, x24\n"
+    "b _ProbeArrayWithRegisters\n"
+);
+
+/* Return address from the original BL at YouTube+0x4919b0 is +0x4919b4. */
+id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInteger count,
+                           uintptr_t ownerX20, uintptr_t providerX22,
+                           uintptr_t mobileX23, uintptr_t wifiX24) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
     uintptr_t expected = (uintptr_t)(0x1004919B4ULL + _dyld_get_image_vmaddr_slide(0));
     if (ret != expected) return g_origArray(receiver, selector, objects, count);
@@ -304,18 +333,17 @@ static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger co
     uint64_t callNumber = __sync_add_and_fetch(&g_targetCalls, 1);
     if (count != 2) {
         __sync_add_and_fetch(&g_targetUnexpectedCount, 1);
-        if (callNumber <= 5) {
-            ProbeRecord([NSString stringWithFormat:
-                @"EXACT CALL #%llu UNEXPECTED count=%lu (wanted original 2); no fallback",
-                (unsigned long long)callNumber, (unsigned long)count], YES);
-        }
+        ProbeRecord([NSString stringWithFormat:
+            @"EXACT CALL #%llu UNEXPECTED count=%lu; no fallback or register dereference",
+            (unsigned long long)callNumber, (unsigned long)count], YES);
         return g_origArray(receiver, selector, objects, count);
     }
     __sync_add_and_fetch(&g_targetCount2, 1);
 
-    // The pointer access below is ARC-compatible (compiled in probe v0.2).
     id __unsafe_unretained first = objects ? objects[0] : nil;
     id __unsafe_unretained second = objects ? objects[1] : nil;
+    uintptr_t firstPtr = (uintptr_t)(__bridge void *)first;
+    uintptr_t secondPtr = (uintptr_t)(__bridge void *)second;
     BOOL firstNil = (first == nil);
     BOOL secondNil = (second == nil);
     if (firstNil) __sync_add_and_fetch(&g_targetNil0, 1);
@@ -324,63 +352,35 @@ static id ProbeArray(id receiver, SEL selector, const id *objects, NSUInteger co
     if (needsFallback) __sync_add_and_fetch(&g_targetFallbacks, 1);
     else __sync_add_and_fetch(&g_targetPassThrough, 1);
 
+    __sync_add_and_fetch(&g_snapshotCalls, 1);
+    // The exact caller has just used x20 to access multiple valid fields.
+    // Read ONLY its +0x18 field and ONLY after confirming the exact return PC.
+    // Avoid touching arbitrary object memory or interpreting unknown pointers
+    // as Objective-C objects. We record pointer presence, not contents.
+    uintptr_t storedReceiver = 0;
+    BOOL ownerNull = ownerX20 == 0;
+    if (!ownerNull) {
+        memcpy(&storedReceiver, (const void *)(ownerX20 + 0x18), sizeof(storedReceiver));
+    }
+    if (storedReceiver == 0) __sync_add_and_fetch(&g_nilStoredReceiver, 1);
+    if (providerX22 == 0) __sync_add_and_fetch(&g_nilProviderRegister, 1);
+    BOOL regsMatchArray = (wifiX24 == firstPtr && mobileX23 == secondPtr);
+    if (!regsMatchArray) __sync_add_and_fetch(&g_snapshotMismatches, 1);
+
     if (callNumber <= 8 || needsFallback) {
         ProbeRecord([NSString stringWithFormat:
-            @"EXACT CALL #%llu count=2 first[0]=%p (%@) second[1]=%p (%@) action=%@",
+            @"EXACT CALL #%llu count=2 owner[x20]=%p storedReceiver[x20+0x18]=%p provider[x22]=%p wifi[x24]=%p mobile[x23]=%p array[0]=%p array[1]=%p regMatches=%@ action=%@",
             (unsigned long long)callNumber,
-            (__bridge void *)first, ProbeObjectClass(first),
-            (__bridge void *)second, ProbeObjectClass(second),
+            (void *)ownerX20, (void *)storedReceiver, (void *)providerX22,
+            (void *)wifiX24, (void *)mobileX23,
+            (void *)firstPtr, (void *)secondPtr,
+            regsMatchArray ? @"yes" : @"no",
             needsFallback ? @"EMPTY_ARRAY_FALLBACK" : @"ORIGINAL_ARRAY"], YES);
     }
 
-    // Avoid the exception only for this call with missing entries. If both
-    // entries are valid, preserve YouTube's original array behavior.
     if (needsFallback) return g_origArray(receiver, selector, NULL, 0);
     return g_origArray(receiver, selector, objects, count);
 }
-
-/*
- * YouTube+0x4918f8 passes x19 into YouTube+0xE3AB8, then stores
- * its return value at [x20+0x18] (YouTube+0x49190c). Later,
- * YouTube+0x49196c loads that field as receiver of keysProvider.
- * Observe only the helper invocation originating from +0x4918fc.
- * We log pointer presence, not contents or class metadata.
- * Uses optional MSHookFunction via dlsym to avoid a link-time
- * dependency on one specific substrate implementation.
- */
-static void *ProbeQualityReceiverHelper(void *input) {
-    uintptr_t ret = (uintptr_t)__builtin_return_address(0);
-    uintptr_t expected = (uintptr_t)(0x100491900ULL + _dyld_get_image_vmaddr_slide(0));
-    void *result = g_origQualityReceiverHelper(input);
-    if (ret == expected) {
-        uint64_t n = __sync_add_and_fetch(&g_helperAtSiteCalls, 1);
-        if (!input) __sync_add_and_fetch(&g_helperNilInput, 1);
-        if (!result) __sync_add_and_fetch(&g_helperNilResult, 1);
-        if (n <= 8) {
-            ProbeRecord([NSString stringWithFormat:
-                @"RECEIVER HELPER #%llu source=YouTube+0x4918fc input=%p (%@) result=%p (%@) -> stored at object+0x18",
-                (unsigned long long)n, input, input ? @"nonnull" : @"nil",
-                result, result ? @"nonnull" : @"nil"], YES);
-        }
-    }
-    return result;
-}
-
-static void ProbeInstallReceiverHelper(void) {
-    typedef void (*HookFn)(void *, void *, void **);
-    HookFn hook = (HookFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!hook) {
-        ProbeRecord(@"RECEIVER HELPER: MSHookFunction unavailable; helper hook NOT installed", YES);
-        return;
-    }
-    void *address = (void *)(uintptr_t)(0x1000E3AB8ULL + _dyld_get_image_vmaddr_slide(0));
-    hook(address, (void *)ProbeQualityReceiverHelper, (void **)&g_origQualityReceiverHelper);
-    g_helperHookInstalled = g_origQualityReceiverHelper != NULL;
-    if (!g_helperHookInstalled) {
-        ProbeRecord(@"RECEIVER HELPER: hook returned without a callable original; do not rely on this IPA", YES);
-    }
-}
-
 static void ProbeInstall(void) {
     g_events = [[NSMutableArray alloc] init];
     g_importantEvents = [[NSMutableArray alloc] init];
@@ -396,9 +396,8 @@ static void ProbeInstall(void) {
     g_arrayHookInstalled = arrayMethod != NULL;
     if (arrayMethod) {
         g_origArray = (id (*)(id, SEL, const id *, NSUInteger))method_getImplementation(arrayMethod);
-        method_setImplementation(arrayMethod, (IMP)ProbeArray);
+        method_setImplementation(arrayMethod, (IMP)ProbeArrayEntry);
     }
-    ProbeInstallReceiverHelper();
     ProbeRecord([NSString stringWithFormat:@"Probe installed: %u getter implementations; NSArray hook=%@; YouTube slide=0x%llx",
                  g_hookCount, arrayMethod ? @"yes" : @"no",
                  (unsigned long long)_dyld_get_image_vmaddr_slide(0)], NO);
