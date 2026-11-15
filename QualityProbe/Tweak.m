@@ -6,10 +6,13 @@
 #import <stdint.h>
 #import <stdlib.h>
 #import <string.h>
+#import <dlfcn.h>
 
 /*
  * Targeted call-site diagnostic for UNPATCHED YouTube 21.44.4.
- * v0.7 snapshots the upstream helper input (x19) at the verified array call.
+ * v0.8 retains the safe register snapshot and instruments the exact
+ * redesigned quality-controller initializer using Objective-C method replacement.
+ * No native MSHookFunction or executable-page mutation is used.
  * No runtime executable-page hooking or modification.
  * Captures the original two array elements at the precise failing call.
  * Returns an empty array ONLY when that exact call contains a nil object.
@@ -58,6 +61,17 @@ static volatile uint64_t g_nilProviderRegister = 0;
 static volatile uint64_t g_snapshotMismatches = 0;
 static id (*g_origArray)(id, SEL, const id *, NSUInteger);
 static __thread BOOL g_inHook = NO;
+
+// Exact Objective-C initializer. The original YouTube 21.44.4 binary
+// implements -[YTVideoQualitySwitchRedesignedController
+// initWithServiceRegistryScope:parentResponder:] at +0x491798.
+// The first argument is in x2: confirmed nil by Probe v0.7.
+static id (*g_origQualityControllerInit)(id, SEL, id, id) = NULL;
+static BOOL g_qualityInitHookInstalled = NO;
+static volatile uint64_t g_qualityInitCalls = 0;
+static volatile uint64_t g_qualityInitNilScope = 0;
+static NSString *g_qualityOriginalIMPImage;
+
 
 static NSString *ProbeObjectClass(id obj) {
     if (!obj) return @"nil";
@@ -129,11 +143,12 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.7 | YouTube 21.44.4 UNPATCHED original array\n"
+            @"YT QUALITY PROBE 0.8 | YouTube 21.44.4 UNPATCHED original array\n"
              @"No runtime URL/profile/content or object string values captured\n"
              @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"ORIGINAL CALLSITE MATCHES: keysProvider=%llu (nil=%llu) wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
-             @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@\n"
+             @"HOOKS: installed=%u NSArray=%@ exactArrayCallSeen=%@ qualityInit=%@ originalIMP=%@\n"
+             @"QUALITY INIT: calls=%llu nilServiceRegistryScope=%llu\n"
              @"REGISTER SNAPSHOT: calls=%llu helperInputNil=%llu storedReceiverNil=%llu providerRegisterNil=%llu mobileRegMismatch=%llu\n"
              @"EXACT CALLS: total=%llu count2=%llu nil0=%llu nil1=%llu emptyFallback=%llu normalPass=%llu unexpectedCount=%llu\n\n"
              @"FIRST IMPORTANT EVENTS (never displaced):\n%@\n\n"
@@ -146,6 +161,10 @@ static NSString *ProbeAllEvents(void) {
             (unsigned long long)g_siteMobileCalls, (unsigned long long)g_siteMobileNil,
             g_hookCount, g_arrayHookInstalled ? @"yes" : @"no",
             g_arrayObserved ? @"yes" : @"no",
+            g_qualityInitHookInstalled ? @"yes" : @"no",
+            g_qualityOriginalIMPImage ?: @"not-found",
+            (unsigned long long)g_qualityInitCalls,
+            (unsigned long long)g_qualityInitNilScope,
             (unsigned long long)g_snapshotCalls,
             (unsigned long long)g_nilHelperInput,
             (unsigned long long)g_nilStoredReceiver,
@@ -386,6 +405,45 @@ id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInte
     if (needsFallback) return g_origArray(receiver, selector, NULL, 0);
     return g_origArray(receiver, selector, objects, count);
 }
+// Diagnostic-only: do not alter the incoming arguments or return value.
+// dladdr identifies whether the call/previous IMP belongs to YouTube or YTLite.
+static NSString *ProbeImageLocation(const void *address) {
+    if (!address) return @"nil";
+    Dl_info info = {0};
+    if (dladdr(address, &info) && info.dli_fname && info.dli_fbase) {
+        const char *base = strrchr(info.dli_fname, '/');
+        const char *name = base ? base + 1 : info.dli_fname;
+        uintptr_t delta = (uintptr_t)address - (uintptr_t)info.dli_fbase;
+        return [NSString stringWithFormat:@"%s+0x%llx", name,
+                (unsigned long long)delta];
+    }
+    return [NSString stringWithFormat:@"unknown:%p", address];
+}
+
+__attribute__((noinline))
+static id ProbeQualityControllerInit(id receiver, SEL selector,
+                                     id serviceRegistryScope, id parentResponder) {
+    const void *caller = __builtin_return_address(0);
+    uint64_t call = __sync_add_and_fetch(&g_qualityInitCalls, 1);
+    BOOL missing = (serviceRegistryScope == nil);
+    if (missing) __sync_add_and_fetch(&g_qualityInitNilScope, 1);
+
+    // Preserve the existing implementation, including any previously
+    // installed YTLite hook. The array hook will avoid the known nil crash.
+    id result = g_origQualityControllerInit(receiver, selector,
+                                            serviceRegistryScope, parentResponder);
+    if (call <= 12 || missing) {
+        ProbeRecord([NSString stringWithFormat:
+            @"QUALITY CONTROLLER INIT #%llu caller=%@ scope=%p scopeClass=%@ parent=%p parentClass=%@ returned=%p resultClass=%@",
+            (unsigned long long)call,
+            ProbeImageLocation(caller),
+            (__bridge void *)serviceRegistryScope, ProbeObjectClass(serviceRegistryScope),
+            (__bridge void *)parentResponder, ProbeObjectClass(parentResponder),
+            (__bridge void *)result, ProbeObjectClass(result)], missing);
+    }
+    return result;
+}
+
 static void ProbeInstall(void) {
     g_events = [[NSMutableArray alloc] init];
     g_importantEvents = [[NSMutableArray alloc] init];
@@ -396,6 +454,20 @@ static void ProbeInstall(void) {
         ProbeHookMethodList(object_getClass(classes[i]));
     }
     if (classes) free(classes);
+
+    // Only replace this ObjC method's IMP. Unlike v0.5, this never writes
+    // YouTube executable pages or hooks the native +0xE3AB8 function.
+    Class qualityClass = objc_getClass("YTVideoQualitySwitchRedesignedController");
+    Method qualityMethod = qualityClass
+        ? class_getInstanceMethod(qualityClass,
+            @selector(initWithServiceRegistryScope:parentResponder:)) : NULL;
+    if (qualityMethod) {
+        IMP previousIMP = method_getImplementation(qualityMethod);
+        g_qualityOriginalIMPImage = ProbeImageLocation((const void *)previousIMP);
+        g_origQualityControllerInit = (id (*)(id, SEL, id, id))previousIMP;
+        method_setImplementation(qualityMethod, (IMP)ProbeQualityControllerInit);
+        g_qualityInitHookInstalled = YES;
+    }
 
     Method arrayMethod = class_getClassMethod([NSArray class], @selector(arrayWithObjects:count:));
     g_arrayHookInstalled = arrayMethod != NULL;
