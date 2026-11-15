@@ -9,7 +9,7 @@
 #import <dlfcn.h>
 
 /*
- * Targeted call-site diagnostic for UNPATCHED YouTube 21.44.4.
+ * Version-specific call-site diagnostic for ORIGINAL UNPATCHED YouTube 21.46.3.
  * v0.8 retains the safe register snapshot and instruments the exact
  * redesigned quality-controller initializer using Objective-C method replacement.
  * No native MSHookFunction or executable-page mutation is used.
@@ -62,9 +62,9 @@ static volatile uint64_t g_snapshotMismatches = 0;
 static id (*g_origArray)(id, SEL, const id *, NSUInteger);
 static __thread BOOL g_inHook = NO;
 
-// Exact Objective-C initializer. The original YouTube 21.44.4 binary
+// Exact Objective-C initializer. The original YouTube 21.46.3 binary
 // implements -[YTVideoQualitySwitchRedesignedController
-// initWithServiceRegistryScope:parentResponder:] at +0x491798.
+// initWithServiceRegistryScope:parentResponder:] at +0x48FCB4.
 // The first argument is in x2: confirmed nil by Probe v0.7.
 static id (*g_origQualityControllerInit)(id, SEL, id, id) = NULL;
 static BOOL g_qualityInitHookInstalled = NO;
@@ -143,7 +143,7 @@ static NSString *ProbeAllEvents(void) {
             : @"(none recorded)";
         NSString *events = [g_events componentsJoinedByString:@"\n"];
         return [NSString stringWithFormat:
-            @"YT QUALITY PROBE 0.8 | YouTube 21.44.4 UNPATCHED original array\n"
+            @"YT QUALITY PROBE 0.8 (21.46.3) | YouTube 21.46.3 UNPATCHED original array\n"
              @"No runtime URL/profile/content or object string values captured\n"
              @"GETTERS: keysProvider=%llu wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
              @"ORIGINAL CALLSITE MATCHES: keysProvider=%llu (nil=%llu) wifiGetter=%llu (nil=%llu) mobileGetter=%llu (nil=%llu)\n"
@@ -227,7 +227,7 @@ static id ProbeGetter(id receiver, SEL selector) {
     // This records the caller before our probe performs any Objective-C calls.
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
     uintptr_t imageBase = 0x100000000ULL + (uintptr_t)_dyld_get_image_vmaddr_slide(0);
-    uintptr_t callerOffset = caller >= imageBase && caller < imageBase + 0x0b7b0000ULL
+    uintptr_t callerOffset = caller >= imageBase && caller < imageBase + 0x0ba04000ULL
         ? caller - imageBase : 0;
     IMP imp = ProbeFindOriginal(receiver, selector);
     if (!imp) {
@@ -250,9 +250,9 @@ static id ProbeGetter(id receiver, SEL selector) {
         callNumber = __sync_add_and_fetch(&g_mobileCalls, 1);
         if (!result) __sync_add_and_fetch(&g_mobileNilCalls, 1);
     }
-    BOOL exactProvider = isProvider && callerOffset == 0x491974ULL;
-    BOOL exactWifi = isWifi && callerOffset == 0x491980ULL;
-    BOOL exactMobile = isMobile && callerOffset == 0x491994ULL;
+    BOOL exactProvider = isProvider && callerOffset == 0x48FE90ULL;
+    BOOL exactWifi = isWifi && callerOffset == 0x48FE9CULL;
+    BOOL exactMobile = isMobile && callerOffset == 0x48FEB0ULL;
     BOOL fromCrashPath = exactProvider || exactWifi || exactMobile;
     if (exactProvider) {
         __sync_add_and_fetch(&g_siteProviderCalls, 1);
@@ -315,8 +315,8 @@ static void ProbeHookMethodList(Class owner) {
  * Objective-C method replacement that worked in probe 0.4. It does not alter
  * YouTube's executable memory (unlike the failed native hook in v0.5).
  *
- * ARM64: at the exact YouTube+0x4919b0 call, x19 = object originally
- * passed to the helper (+0xE3AB8); x20 = owning internal object;
+ * ARM64: at the exact YouTube+0x48FECC call, x19 = object originally
+ * passed to the helper (+0xE9D68); x20 = owning internal object;
  * x22 = keysProvider result; x23 = mobile key result. All are callee-saved
  * and survive the intervening Objective-C calls. We copy them into free
  * argument registers x4..x7, then tail-branch to our Objective-C IMP.
@@ -343,12 +343,12 @@ __asm__(
     "b _ProbeArrayWithRegisters\n"
 );
 
-/* Return address from the original BL at YouTube+0x4919b0 is +0x4919b4. */
+/* Return address from the original BL at YouTube+0x48FECC is +0x48FED0. */
 id ProbeArrayWithRegisters(id receiver, SEL selector, const id *objects, NSUInteger count,
                            uintptr_t ownerX20, uintptr_t providerX22,
                            uintptr_t mobileX23, uintptr_t helperInputX19) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
-    uintptr_t expected = (uintptr_t)(0x1004919B4ULL + _dyld_get_image_vmaddr_slide(0));
+    uintptr_t expected = (uintptr_t)(0x10048FED0ULL + _dyld_get_image_vmaddr_slide(0));
     if (ret != expected) return g_origArray(receiver, selector, objects, count);
 
     g_arrayObserved = YES;
@@ -456,7 +456,7 @@ static void ProbeInstall(void) {
     if (classes) free(classes);
 
     // Only replace this ObjC method's IMP. Unlike v0.5, this never writes
-    // YouTube executable pages or hooks the native +0xE3AB8 function.
+    // YouTube executable pages or hooks the native +0xE9D68 function.
     Class qualityClass = objc_getClass("YTVideoQualitySwitchRedesignedController");
     Method qualityMethod = qualityClass
         ? class_getInstanceMethod(qualityClass,
