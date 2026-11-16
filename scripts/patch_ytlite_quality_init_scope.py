@@ -16,6 +16,8 @@ YouTube+0x48FC2C and +0x48FC30. The fix has NOT been device-tested.
 """
 from __future__ import annotations
 import argparse
+import copy
+import hashlib
 import re
 import shutil
 import struct
@@ -124,21 +126,28 @@ def patch_ipa(source: Path, dest: Path) -> None:
         if tweak_name.split('/')[1] != yt_name.split('/')[1]:
             raise ValueError('YTLite and YouTube are from different app bundles')
         original = zin.read(tweak_name)
-        replacement = patch_ytlite(original, zin.read(yt_name))
+        youtube_data = zin.read(yt_name)
+        youtube_sha256 = hashlib.sha256(youtube_data).digest()
+        replacement = patch_ytlite(original, youtube_data)
+        del youtube_data
         try:
             with zipfile.ZipFile(dest, 'w') as zout:
                 zout.comment = zin.comment
                 for info in zin.infolist():
                     if info.filename == tweak_name:
-                        zout.writestr(info, replacement)
+                        zout.writestr(copy.copy(info), replacement)
                     elif info.is_dir():
-                        zout.writestr(info, b'')
+                        zout.writestr(copy.copy(info), b'')
                     else:
-                        with zin.open(info) as input_stream, zout.open(info, 'w') as output_stream:
+                        with zin.open(info) as input_stream, zout.open(copy.copy(info), 'w') as output_stream:
                             shutil.copyfileobj(input_stream, output_stream, 1024*1024)
             with zipfile.ZipFile(dest) as check:
                 assert_bytes(check.read(tweak_name), {k:v[1] for k,v in PATCHES.items()}, 'Output IPA')
-                if check.read(yt_name)[:1024] != zin.read(yt_name)[:1024]:
+                youtube_check = hashlib.sha256()
+                with check.open(yt_name) as youtube_stream:
+                    for chunk in iter(lambda: youtube_stream.read(1024*1024), b''):
+                        youtube_check.update(chunk)
+                if youtube_check.digest() != youtube_sha256:
                     raise AssertionError('YouTube executable was unexpectedly changed')
         except Exception:
             dest.unlink(missing_ok=True)
