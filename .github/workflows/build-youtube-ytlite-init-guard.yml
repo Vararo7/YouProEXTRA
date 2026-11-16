@@ -429,7 +429,6 @@ jobs:
           echo "IPA_NAME=$ipa_name" >> "$GITHUB_ENV"
 
       - name: Experimental YTLite Quality Init Guard
-        if: inputs.pleasedontstopthemusic == true && steps.cache_tweaks.outputs.cache_pleasedontstopthemusic_hit != 'true'
         run: |
           python3 scripts/patch_ytlite_quality_init.py "$IPA_NAME" guarded.ipa
           mv guarded.ipa "$IPA_NAME"
